@@ -16,5 +16,6 @@ RUN python3 -m pip install --upgrade pip
 RUN python3 -m pip install -r requirements.txt
 
 ADD ./speech_to_text.py speech_to_text.py
+ADD ./error_reporting_wrapper.py error_reporting_wrapper.py
 
-ENTRYPOINT ["python3", "speech_to_text.py"]
+ENTRYPOINT ["python3", "error_reporting_wrapper.py", "python3", "speech_to_text.py"]
