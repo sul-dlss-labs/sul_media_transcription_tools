@@ -1,0 +1,22 @@
+# the project name needs to uniquely identify your application in AWS S3
+
+variable "project_name" {
+  default = "my-project-name"
+}
+
+variable "region" {
+  default = "us-east-1"
+}
+
+variable "availability_zone" {
+  default = "us-east-1a"
+}
+
+variable "default_tags" {
+  default = {
+    environment = "production"
+    project     = "speech_to_text"
+    terraform   = "true"
+  }
+}
+
