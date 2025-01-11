@@ -2,14 +2,32 @@
 
 [![Test](https://github.com/sul-dlss/speech-to-text/actions/workflows/test.yml/badge.svg)](https://github.com/sul-dlss/speech-to-text/actions/workflows/test.yml)
 
-This repository contains a Docker configuration for performing serverless speech-to-text processing with Whisper using an Amazon Simple Storage Service (S3) bucket for media files, and Amazon Simple Queue Service (SQS) for coordinating work.
+This repository contains a Docker configuration for performing speech-to-text processing with [Whisper](https://openai.com/index/whisper/) using Amazon Web Services (AWS) to provision GPU resources on demand, and to tear them down when there is no more remaining work. It uses:
 
-## Build
+* [AWS S3](https://aws.amazon.com/s3/): to store media in need of transcription and the transcription results
+* [AWS Batch](https://aws.amazon.com/batch/): which manages w work queue and provisioning EC2 instances.
+* [AWS SQS](https://aws.amazon.com/sqs/): to receive a notification when work is completed
+* [AWS ECR](https://aws.amazon.com/ecr/): to store the speech-to-text Docker image
 
-First a note of caution if you are updating the Docker image. In order to prevent random segmentation faults you will want to make sure that:
+## Configure AWS
 
-1. You are using an [nvidia/cuda](https://hub.docker.com/r/nvidia/cuda) base Docker image.
-2. The version of CUDA you are using in the Docker container aligns with the version of CUDA that is installed in the host operating system that is running Docker.
+A [Terraform](https://www.terraform.io/) configuration is included to help you configure AWS. Once you have installed Terraform you can set up resources you need to configure your `project_name` which is used to name resources in AWS:
+
+```shell
+cd terraform
+cp variables.example variables.tf
+# edit variables.tf with your text editor
+```
+
+Now you can validate and (if everything looks ok) apply your changes:
+
+```shell
+cd terraform
+terraform validate
+terraform apply
+```
+
+## Build Docker Image
 
 To build the container you will need to first download the pytorch models that Whisper uses. This is about 13GB of data and can take some time! The idea here is to bake the models into Docker image so they don't need to be fetched dynamically every time the container runs (which will add to the runtime). If you know you only need one size model, and want to just include that then edit the `whisper_models/urls.txt` file accordingly before running the `wget` command.
 
@@ -23,67 +41,40 @@ Then you can build the image:
 docker build --tag sul-speech-to-text .
 ```
 
-## Configure AWS
+## Push Docker Image
 
-Create two queues, one for new jobs, and one for completed jobs:
+You will need to push your Docker image to the ECR repository that Terraform created. You can ask Terraform for the repository URL that it created. For example mine is:
 
 ```shell
-$ aws sqs create-queue --queue-name sul-speech-to-text-todo-your-username
-$ aws sqs create-queue --queue-name sul-speech-to-text-done-your-username
+terraform output docker_repository
+"482101366956.dkr.ecr.us-east-1.amazonaws.com/edsu-speech-to-text-qa"
 ```
 
-Create a bucket:
+Tag your Docker image with the ECR URL:
 
 ```shell
-aws s3 mb s3://sul-speech-to-text-dev-your-username
+docker tag speech-to-text YOUR-ECR-URL
 ```
 
-Configure `.env` with your AWS credentials so the Docker container can find them:
+Ensure your Docker client is logged in:
 
 ```shell
-cp env-example .env
-vi .env
+aws ecr get-login-password | docker login --username AWS --password-stdin YOUR-ECR-URL
+```
+
+And then you can push the Docker image:
+
+```shell
+docker push YOUR-ECR-URL
 ```
 
 ## Run
 
 ### Create a Job
 
-Usually common-accessioning robots will initiate new speech-to-text work by:
+#### The Job Message Structure
 
-1. minting a new job ID
-3. copying a media file to the S3 bucket
-5. putting a job in the TODO queue
-
-For testing you can simulate these things by running the Docker container with the `--create` flag. For example if you have a `file.mp4` file you'd like to create a job for you can:
-
-```shell
-docker run --rm --tty --volume .:/app --env-file .env sul-speech-to-text --create file.mp4
-```
-
-### Run the Job
-
-Now you can run the container and have it pick up the job you placed into the queue. You can drop the `--gpus all` if you don't have a GPU.
-
-```shell
-docker run --rm --tty --env-file .env --gpus all sul-speech-to-text --no-daemon
-```
-
-Wait for the results to appear:
-
-```shell
-aws s3 ls s3://sul-speech-to-text-dev-your-username/out/${JOB_ID}/
-```
-
-Usually the message on the DONE queue will be processed by the captionWF in common-accessioning, but if you want you can pop messages off manually:
-
-```shell
-docker run --rm --tty --env-file .env sul-speech-to-text --receive-done
-```
-
-## The Job Message Structure
-
-The job is a JSON object (used as an SQS message payload) that contains information about how to run Whisper. Minimally it contains the Job ID and a list of S3 bucket file paths, which will be used to locate media files in S3 that need to be processed.
+The speech-to-text job is a JSON object that contains information about how to run Whisper. Minimally it contains the Job ID and a list of S3 bucket file paths, which will be used to locate media files in S3 that need to be processed.
 
 ```json
 {
@@ -96,7 +87,7 @@ The job is a JSON object (used as an SQS message payload) that contains informat
 
 The job id must be a unique identifier like a UUID. In some use cases a natural key could be used, as is the case in the SDR where druid-version is used.
 
-## Whisper Options
+#### Whisper Options
 
 You can also pass in options for Whisper, note that any options for how the transcript is serialized with a writer are given using the `writer` key:
 
@@ -210,6 +201,8 @@ When a job completes you will receive a message on the DONE SQS queue which will
 }
 ```
 
+You can then use an AWS S3 client to download the transcripts given in the `output` JSON stanza.
+
 If there was an error during processing the `output` will be an empty list, and an `error` property will be set to a message indicating what went wrong.
 
 ```json
@@ -231,6 +224,43 @@ If there was an error during processing the `output` will be an empty list, and 
 }
 ```
 
+## Manually Running a Job
+
+The speech-to-text service has been designed so that software (in our case [common-accessioning](https://github.com/sul-dlss/common-accessioning)) can upload media files to S3 and then execute the AWS Batch job using an AWS client, and then listen for the "done" message. If you would like to simulate these steps yourself you can run the `speech_to_text.py` with the `--create` and `--done` flags.
+
+First you will need a `.env` file that tells `speech_to_text.py` your AWS credentials and some of the resources that Terraform configured for you.
+
+```
+cp env-example .env
+```
+
+Then replace the `CHANGE_ME` values in the `.env` file. You can use `terraform output` to determine the names for AWS resources like the S3 bucket, the region, and the queues.
+
+Then you are ready to create a job. Here a job is being created for the `file.mp4` media file:
+
+```shell
+python speech_to_text.py --create file.mp4
+```
+
+This will:
+
+1. Mint a Job ID.
+2. Upload `file.mp4` to the S3 bucket.
+3. Send the job to AWS Batch using some default Whisper options.
+
+Then you can check periodically to see if the job is completed by running:
+
+```shell
+python speech_to_text.py --done
+```
+
+This will:
+
+1. Look for a done message in the SQS queue.
+2. Delete the message from the queue so it isn't picked up again.
+3. Print the received finished job JSON.
+3. Download the generated transcript files from the S3 bucket to the current working directory.
+
 ## Testing
 
 To run the tests it is probably easiest to create a virtual environment and run the tests with pytest:
@@ -251,6 +281,13 @@ You may need to install `ffmpeg` on your laptop in order to run the tests.  On a
 If you get no result, install with:
 
 `brew install ffmpeg`
+
+## Updating Docker Image
+
+When updating the base Docker image, in order to prevent random segmentation faults you will want to make sure that:
+
+1. You are using an [nvidia/cuda](https://hub.docker.com/r/nvidia/cuda) base Docker image.
+2. The version of CUDA you are using in the Docker container aligns with the version of CUDA that is installed in the host operating system that is running Docker.
 
 ## Linting and Type Checking
 

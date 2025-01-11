@@ -4,3 +4,7 @@ __pycache__/
 whisper_models
 *.log
 .python-version
+.terraform*
+terraform.tfstate
+terraform.tfstate.backup
+variables.tf

@@ -11,7 +11,6 @@ import speech_to_text
 from unittest.mock import patch
 
 BUCKET = "bucket"
-TODO_QUEUE = "todo"
 DONE_QUEUE = "done"
 
 
@@ -23,9 +22,14 @@ def aws_credentials():
     os.environ["AWS_SECURITY_TOKEN"] = "testing"
     os.environ["AWS_SESSION_TOKEN"] = "testing"
     os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
-    os.environ["SPEECH_TO_TEXT_TODO_SQS_QUEUE"] = TODO_QUEUE
     os.environ["SPEECH_TO_TEXT_DONE_SQS_QUEUE"] = DONE_QUEUE
     os.environ["SPEECH_TO_TEXT_S3_BUCKET"] = BUCKET
+
+
+@pytest.fixture
+def honeybadger_env():
+    """Mocked Honeybadger key."""
+    os.environ["HONEYBADGER_API_KEY"] = "abc123"
 
 
 @pytest.fixture
@@ -53,21 +57,24 @@ def bucket(s3):
 
 @pytest.fixture
 def queues(sqs):
-    sqs.create_queue(QueueName=TODO_QUEUE)
     sqs.create_queue(QueueName=DONE_QUEUE)
 
 
 # ignore utcnow warning until https://github.com/boto/boto3/issues/3889 is resolved
 @pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow")
-def test_speech_to_text(bucket, queues):
-    # upload a audio file to s3 and create the sqs job that sets max_line_width
-    job_id = speech_to_text.create_job(
-        Path("tests/data/en.wav"),
-        options={"model": "small", "writer": {"max_line_width": 42}},
-    )
+def test_happy_path(bucket, queues):
+    job_id = str(uuid.uuid4())
+
+    speech_to_text.add_media("tests/data/en.wav", job_id)
+
+    job = {
+        "id": job_id,
+        "media": [{"name": f"{job_id}/en.wav"}],
+        "options": {"model": "tiny", "writer": {"max_line_width": 42}},
+    }
 
     # run the job
-    speech_to_text.main(daemon=False)
+    speech_to_text.main(job=job)
 
     # is the whisper output in s3?
     test_bucket = speech_to_text.get_bucket()
@@ -118,22 +125,22 @@ def test_speech_to_text(bucket, queues):
 def test_file_options(bucket, queues):
     media_path = Path("tests/data/en.wav")
     job_id = str(uuid.uuid4())
+
     speech_to_text.add_media(media_path, job_id)
-    speech_to_text.add_job(
-        {
-            "id": job_id,
-            "media": [
-                {
-                    "name": f"{job_id}/{media_path.name}",
-                    "options": {"language": "en", "writer": {"max_line_width": 20}},
-                }
-            ],
-            "options": {"model": "tiny", "writer": {"max_line_width": 42}},
-        }
-    )
+
+    job = {
+        "id": job_id,
+        "media": [
+            {
+                "name": f"{job_id}/{media_path.name}",
+                "options": {"language": "en", "writer": {"max_line_width": 20}},
+            }
+        ],
+        "options": {"model": "tiny", "writer": {"max_line_width": 42}},
+    }
 
     # run the job
-    speech_to_text.main(daemon=False)
+    speech_to_text.main(job)
 
     # look at the done job to see if whisper ran with language=fr
     queue = speech_to_text.get_done_queue()
@@ -155,10 +162,10 @@ def test_exception_handling(bucket, queues):
     media_path = Path("tests/data/en.wav")
     job_id = str(uuid.uuid4())
     speech_to_text.add_media(media_path, job_id)
-    speech_to_text.add_job({"id": job_id, "media": ["foo"]})
+    job = {"id": job_id, "media": ["foo"]}
 
-    # run the job
-    speech_to_text.main(daemon=False)
+    with pytest.raises(Exception):
+        speech_to_text.main(job)
 
     # look at the done job to see if whisper ran with language=fr
     queue = speech_to_text.get_done_queue()
@@ -167,27 +174,29 @@ def test_exception_handling(bucket, queues):
 
     job = json.loads(msgs[0].body)
     assert "error" in job, "it's an error message"
-    assert re.match("^Caught unexpected error.*", job["error"]), "error message"
+    assert re.match("^Unexpected error.*", job["error"]), "error message"
 
 
 # ignore utcnow warning until https://github.com/boto/boto3/issues/3889 is resolved
 @pytest.mark.filterwarnings("ignore:datetime.datetime.utcnow")
 @patch("speech_to_text.honeybadger")  # Mock the honeybadger module
-def test_honeybadger_notification(mock_honeybadger, bucket, queues):
+def test_honeybadger_notification(mock_honeybadger, bucket, queues, honeybadger_env):
     # ensure that honeybadger is notified when an exception occurs
     media_path = Path("tests/data/en.wav")
     job_id = str(uuid.uuid4())
     speech_to_text.add_media(media_path, job_id)
 
     # Create an invalid job to trigger an exception
-    speech_to_text.add_job({"id": job_id, "media": ["foo"]})
+    job = {"id": job_id, "media": ["foo"]}
 
-    # run the job
-    speech_to_text.main(daemon=False)
+    # run the job, expecting an exception
+    with pytest.raises(Exception):
+        speech_to_text.main(job)
 
     # Assert that honeybadger.notify was called
     mock_honeybadger.notify.assert_called_once()
     args, kwargs = mock_honeybadger.notify.call_args
+
     assert kwargs["error_class"] == "SpeechToTextError"
     assert "Whisper AWS process" in kwargs["error_message"]
     assert "job" in kwargs["context"]
